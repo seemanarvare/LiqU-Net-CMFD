@@ -1,60 +1,106 @@
+import tensorflow as tf
+import pandas as pd
 import os
-import numpy as np
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from sklearn.model_selection import train_test_split
 
-# Paths
-images_dir = r"D:\datasets\CoMoFoD\images"
-masks_dir = r"D:\datasets\CoMoFoD\masks"
-output_dir = r"D:\datasets\CoMoFoD\processed"
+# Configuration
+dataset_paths = {
+    'CoMoFoD': {
+        'train': './data/CoMoFoD/train_dataset.csv',
+        'val': './data/CoMoFoD/val_dataset.csv',
+        'test': './data/CoMoFoD/test_dataset.csv'
+    },
+    'IMD': {
+        'train': './data/IMD/train_dataset.csv',
+        'val': './data/IMD/val_dataset.csv',
+        'test': './data/IMD/test_dataset.csv'
+    },
+    'ARD': {
+        'train': './data/ARD/train_dataset.csv',
+        'val': './data/ARD/val_dataset.csv',
+        'test': './data/ARD/test_dataset.csv'
+    },
+    'Covrage': {
+        'train': './data/Covrage/train_dataset.csv',
+        'val': './data/Covrage/val_dataset.csv',
+        'test': './data/Covrage/test_dataset.csv'
+    },
+    'GRip': {
+        'train': './data/GRip/train_dataset.csv',
+        'val': './data/GRip/val_dataset.csv',
+        'test': './data/GRip/test_dataset.csv'
+    }
+}
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
 
-img_size = (224, 224)
+# Data Loader 
+def create_dataset(csv_path, batch_size):
+    """Load and preprocess images and masks from CSV file."""
+    df = pd.read_csv(csv_path)
+    dataset = tf.data.Dataset.from_tensor_slices((df['Image_Path'], df['Mask_Path']))
 
-os.makedirs(output_dir, exist_ok=True)
-
-def load_images_and_masks(images_dir, masks_dir, target_size):
-    images, masks = [], []
-    for filename in os.listdir(images_dir):
-        if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-            continue
-
-        img_path = os.path.join(images_dir, filename)
-        mask_name = os.path.splitext(filename)[0] + "_gt.png"  # adjust if mask naming different
-        mask_path = os.path.join(masks_dir, mask_name)
-
-        if not os.path.exists(mask_path):
-            print(f"Mask not found for {filename}, skipping...")
-            continue
-
+    def load_and_preprocess(img_path, mask_path):
         # Load and preprocess image
-        img = load_img(img_path, target_size=target_size)
-        img = img_to_array(img) / 255.0
+        img = tf.io.read_file(img_path)
+        img = tf.image.decode_jpeg(img, channels=3)
+        img = tf.image.resize(img, IMG_SIZE, method='bilinear')  # Bilinear interpolation
+        img = tf.keras.applications.resnet50.preprocess_input(img)  # ImageNet normalization
 
         # Load and preprocess mask
-        mask = load_img(mask_path, target_size=target_size, color_mode="grayscale")
-        mask = img_to_array(mask) / 255.0
-        mask = (mask > 0.5).astype(np.float32)  # binarize
+        mask = tf.io.read_file(mask_path)
+        mask = tf.image.decode_png(mask, channels=1)
+        mask = tf.image.resize(mask, IMG_SIZE, method='nearest')  # Nearest-neighbor for masks
+        mask = mask / 255.0  # Normalize to [0, 1]
+        return img, mask
 
-        images.append(img)
-        masks.append(mask)
+    dataset = dataset.map(load_and_preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-    return np.array(images), np.array(masks)
+def load_all_datasets(dataset_paths, split, batch_size):
+    """Combine datasets for training, validation, or testing."""
+    datasets = [create_dataset(paths[split], batch_size) for paths in dataset_paths.values()]
+    return tf.data.Dataset.concatenate(*datasets)
 
-# Load dataset
-print("Loading dataset...")
-X, y = load_images_and_masks(images_dir, masks_dir, img_size)
-print("Dataset loaded:", X.shape, y.shape)
+# Save datasets
+def save_datasets():
+    """Load and save datasets for training, validation, and testing."""
+    os.makedirs('./output/datasets', exist_ok=True)
+    print("Loading and saving datasets...")
+    
+    # Training dataset
+    train_dataset = load_all_datasets(dataset_paths, 'train', BATCH_SIZE)
+    train_images, train_masks = [], []
+    for img, mask in train_dataset.unbatch():
+        train_images.append(img.numpy())
+        train_masks.append(mask.numpy())
+    train_images = np.array(train_images)
+    train_masks = np.array(train_masks)
+    np.save('./output/datasets/train_images.npy', train_images)
+    np.save('./output/datasets/train_masks.npy', train_masks)
+    
+    # Validation dataset
+    val_dataset = load_all_datasets(dataset_paths, 'val', BATCH_SIZE)
+    val_images, val_masks = [], []
+    for img, mask in val_dataset.unbatch():
+        val_images.append(img.numpy())
+        val_masks.append(mask.numpy())
+    val_images = np.array(val_images)
+    val_masks = np.array(val_masks)
+    np.save('./output/datasets/val_images.npy', val_images)
+    np.save('./output/datasets/val_masks.npy', val_masks)
+    
+    # Test dataset
+    test_dataset = load_all_datasets(dataset_paths, 'test', BATCH_SIZE)
+    test_images, test_masks = [], []
+    for img, mask in test_dataset.unbatch():
+        test_images.append(img.numpy())
+        test_masks.append(mask.numpy())
+    test_images = np.array(test_images)
+    test_masks = np.array(test_masks)
+    np.save('./output/datasets/test_images.npy', test_images)
+    np.save('./output/datasets/test_masks.npy', test_masks)
+    
+    print("Datasets saved to './output/datasets/'")
 
-# Train-val-test split
-X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42)
-X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
-
-# Save preprocessed data
-np.save(os.path.join(output_dir, "X_train.npy"), X_train)
-np.save(os.path.join(output_dir, "y_train.npy"), y_train)
-np.save(os.path.join(output_dir, "X_val.npy"), X_val)
-np.save(os.path.join(output_dir, "y_val.npy"), y_val)
-np.save(os.path.join(output_dir, "X_test.npy"), X_test)
-np.save(os.path.join(output_dir, "y_test.npy"), y_test)
-
-print("Preprocessing completed. Files saved in:", output_dir)
+if __name__ == "__main__":
+    save_datasets()
