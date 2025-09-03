@@ -16,63 +16,6 @@ def load_trained_model(model_path):
     """Load the trained model with custom LiquidLayer."""
     return tf.keras.models.load_model(model_path, custom_objects={'LiquidLayer': LiquidLayer})
 
-def load_test_images_and_masks(images_dir, masks_dir):
-    """Load test images and masks, raising an error if a mask is missing."""
-    image_paths = []
-    for ext in ['.jpg', '.png', '.bmp', '.tif', '.tiff', '.jpeg']:
-        image_paths.extend(
-            [os.path.join(images_dir, f) for f in os.listdir(images_dir) if f.lower().endswith(ext)]
-        )
-    image_paths = sorted(image_paths)
-    
-    masks = []
-    filenames = []
-    
-    for img_path in image_paths:
-        filename = os.path.basename(img_path)
-        print(f"Processing image: {filename}")
-        
-        filename_base = os.path.splitext(filename)[0]
-        mask_found = False
-        
-        for suffix in ['_gt', '_mask']:
-            for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff']:
-                mask_path = os.path.join(masks_dir, f"{filename_base}{suffix}{ext}")
-                if os.path.exists(mask_path):
-                    mask = image.load_img(mask_path, target_size=IMG_SIZE, color_mode="grayscale")
-                    mask = image.img_to_array(mask) / 255.0
-                    print(f"Loaded mask for {filename}: {mask_path}")
-                    masks.append(mask)
-                    filenames.append(filename)
-                    mask_found = True
-                    break
-            if mask_found:
-                break
-        
-        if not mask_found:
-            raise FileNotFoundError(f"No mask found for image: {img_path}")
-    
-    return image_paths, np.array(masks), filenames
-
-def load_images_in_batches(image_paths, batch_size=BATCH_SIZE):
-    """Load images in batches for prediction."""
-    for start in range(0, len(image_paths), batch_size):
-        end = min(start + batch_size, len(image_paths))
-        batch_paths = image_paths[start:end]
-        batch_images = []
-        for img_path in batch_paths:
-            img = image.load_img(img_path, target_size=IMG_SIZE)
-            img = image.img_to_array(img)
-            img = preprocess_input(img)
-            batch_images.append(img)
-        yield np.array(batch_images)
-
-def resize_mask(mask, target_size):
-    """Resize mask using nearest-neighbor interpolation."""
-    mask_img = Image.fromarray((mask.squeeze() * 255).astype(np.uint8))
-    resized_mask_img = mask_img.resize(target_size, resample=Image.NEAREST)
-    return np.expand_dims(np.array(resized_mask_img) / 255.0, axis=-1)
-
 def adaptive_binarize(mask):
     """Apply global and local thresholding with morphological dilation."""
     mask = mask.squeeze()
@@ -170,27 +113,37 @@ def evaluate_model():
     for dataset_name, test_dataset in test_datasets.items():
         print(f"Evaluating on dataset: {dataset_name}")
         
-        # Get image and mask paths directly from preprocessing
-        images_dir = test_dataset.element_spec[0].shape[0].name.split(':')[0].rsplit('/', 2)[0]
-        masks_dir = test_dataset.element_spec[1].shape[0].name.split(':')[0].rsplit('/', 2)[0]
-        image_paths, test_masks, test_filenames = load_test_images_and_masks(images_dir, masks_dir)
+        # Extract images and masks from dataset
+        images, masks, filenames = [], [], []
+        for img, mask, fname in test_dataset:
+            images.append(img.numpy())
+            masks.append(mask.numpy())
+            filenames.append(os.path.basename(fname.numpy().decode('utf-8')))
+        
+        images = np.array(images)
+        masks = np.array(masks)
+        
+        if len(images) == 0:
+            print(f"Warning: No images found for dataset {dataset_name}, skipping.")
+            continue
         
         # Predict in batches
         predictions_bin = []
-        for batch_images in load_images_in_batches(image_paths):
+        for i in range(0, len(images), BATCH_SIZE):
+            batch_images = images[i:i + BATCH_SIZE]
             predictions = model.predict(batch_images, batch_size=BATCH_SIZE)
             predictions_bin.extend([adaptive_binarize(pred) for pred in predictions])
         predictions_bin = np.array(predictions_bin)
         
         # Binarize ground truth masks
-        resized_test_masks_bin = np.array([adaptive_binarize(resize_mask(mask, IMG_SIZE)) for mask in test_masks])
+        resized_test_masks_bin = np.array([adaptive_binarize(mask) for mask in masks])
         
         # Compute metrics
         metrics_data = []
         sum_metrics = {key: 0 for key in compute_metrics(resized_test_masks_bin[0], predictions_bin[0]).keys()}
-        num_images = len(test_filenames)
+        num_images = len(filenames)
         
-        for i, filename in enumerate(test_filenames):
+        for i, filename in enumerate(filenames):
             mask = resized_test_masks_bin[i]
             pred_mask = predictions_bin[i]
             
@@ -202,8 +155,7 @@ def evaluate_model():
                 sum_metrics[key] += metrics.get(key, 0)
             
             # Visualize
-            original_image = image.load_img(image_paths[i], target_size=IMG_SIZE)
-            original_image = image.img_to_array(original_image)
+            original_image = images[i]
             visualize_comparison_with_overlay(original_image, mask, pred_mask, filename, dataset_name)
         
         # Save per-image metrics
@@ -229,6 +181,103 @@ def evaluate_model():
         print(f"Metrics saved to: {output_dir}")
     
     return results
+
+def evaluate_new_dataset(images_dir, masks_dir, dataset_name, model):
+    """Evaluate the model on a new dataset."""
+    image_paths = []
+    for ext in ['.jpg', '.png', '.bmp', '.tif', '.tiff', '.jpeg']:
+        image_paths.extend(
+            [os.path.join(images_dir, f) for f in os.listdir(images_dir) if f.lower().endswith(ext)]
+        )
+    image_paths = sorted(image_paths)
+    
+    images, masks, filenames = [], [], []
+    for img_path in image_paths:
+        filename = os.path.basename(img_path)
+        print(f"Processing image: {filename}")
+        
+        filename_base = os.path.splitext(filename)[0]
+        mask_found = False
+        
+        for suffix in ['_gt', '_mask']:
+            for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff']:
+                mask_path = os.path.join(masks_dir, f"{filename_base}{suffix}{ext}")
+                if os.path.exists(mask_path):
+                    img = image.load_img(img_path, target_size=IMG_SIZE)
+                    img = image.img_to_array(img)
+                    img = preprocess_input(img)
+                    
+                    mask = image.load_img(mask_path, target_size=IMG_SIZE, color_mode="grayscale")
+                    mask = image.img_to_array(mask) / 255.0
+                    
+                    images.append(img)
+                    masks.append(mask)
+                    filenames.append(filename)
+                    mask_found = True
+                    print(f"Loaded mask for {filename}: {mask_path}")
+                    break
+            if mask_found:
+                break
+        
+        if not mask_found:
+            raise FileNotFoundError(f"No mask found for image: {img_path}")
+    
+    images = np.array(images)
+    masks = np.array(masks)
+    
+    if len(images) == 0:
+        print(f"Warning: No images found for dataset {dataset_name}, skipping.")
+        return None
+    
+    # Predict in batches
+    predictions_bin = []
+    for i in range(0, len(images), BATCH_SIZE):
+        batch_images = images[i:i + BATCH_SIZE]
+        predictions = model.predict(batch_images, batch_size=BATCH_SIZE)
+        predictions_bin.extend([adaptive_binarize(pred) for pred in predictions])
+    predictions_bin = np.array(predictions_bin)
+    
+    # Binarize ground truth masks
+    resized_test_masks_bin = np.array([adaptive_binarize(mask) for mask in masks])
+    
+    # Compute metrics
+    metrics_data = []
+    sum_metrics = {key: 0 for key in compute_metrics(resized_test_masks_bin[0], predictions_bin[0]).keys()}
+    num_images = len(filenames)
+    
+    for i, filename in enumerate(filenames):
+        mask = resized_test_masks_bin[i]
+        pred_mask = predictions_bin[i]
+        
+        metrics = compute_metrics(mask, pred_mask)
+        metrics['Filename'] = filename
+        metrics_data.append(metrics)
+        
+        for key in sum_metrics.keys():
+            sum_metrics[key] += metrics.get(key, 0)
+        
+        # Visualize
+        original_image = images[i]
+        visualize_comparison_with_overlay(original_image, mask, pred_mask, filename, dataset_name)
+    
+    # Save per-image metrics
+    output_dir = os.path.join(OUTPUT_FOLDER, dataset_name)
+    os.makedirs(output_dir, exist_ok=True)
+    metrics_df = pd.DataFrame(metrics_data)
+    metrics_df.to_excel(os.path.join(output_dir, f'{dataset_name}_image_metrics.xlsx'), index=False)
+    
+    # Save average metrics
+    average_metrics = {key: (value / num_images) if key != 'Filename' else 'Average' for key, value in sum_metrics.items()}
+    average_metrics_df = pd.DataFrame([average_metrics])
+    average_metrics_df.to_excel(os.path.join(output_dir, f'{dataset_name}_average_metrics.xlsx'), index=False)
+    
+    print(f"Dataset: {dataset_name}")
+    for key, value in average_metrics.items():
+        if key != 'Filename':
+            print(f"{key}: {value:.4f}" if isinstance(value, float) else f"{key}: {value}")
+    print(f"Metrics saved to: {output_dir}")
+    
+    return {'image_metrics': metrics_data, 'average_metrics': average_metrics}
 
 def plot_accuracy_and_loss(history):
     """Plot training and validation accuracy and loss."""
@@ -258,3 +307,5 @@ if __name__ == "__main__":
     history, model = train_model()
     plot_accuracy_and_loss(history)
     results = evaluate_model()
+    # Example for new dataset (uncomment to use):
+    # new_results = evaluate_new_dataset('path/to/new/images', 'path/to/new/masks', 'NewDataset', model)
